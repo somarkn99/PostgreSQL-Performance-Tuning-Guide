@@ -1,45 +1,195 @@
+# PostgreSQL Performance Tuning Guide + Baselines
 
-# PostgreSQL Tuning Baselines (Practical Examples)
-
-This companion to `postgres_tuning.md` gives **ready-to-use** starting configs for common RAM sizes and workloads. Treat these as **baselines**—measure, then iterate (see the validation checklist at the end).
-
-> Assumptions
-> - PostgreSQL 15+
-> - Single PostgreSQL instance per VM
-> - OS cache available to Postgres (no huge page constraints)
-> - Connection pooling via PgBouncer in **transaction** mode
-> - Typical web workload (OLTP) unless stated
+This document combines **step-by-step tuning methodology** with **ready-to-use baseline configs** for PostgreSQL.  
+It helps you calculate memory budgets, adjust for workloads, and provides concrete example configurations for 4GB, 8GB, and 16GB RAM servers.  
 
 ---
 
-## Quick Rules of Thumb (re-cap)
+## 1) Gather the Baseline
+- **Total RAM** on the server (or VM/Container host).
+- **Actual concurrency**: how many queries are really active at the same time (not just `max_connections`).
+- **PgBouncer presence**: if you have PgBouncer (recommended), actual concurrency is much lower than total client connections.
+- **Query types**: heavy sorts/joins? periodic index builds? long reports?
+
+### Quick commands
+```bash
+# RAM and capacity
+free -h
+
+# Active connections
+psql -c "SELECT count(*) FROM pg_stat_activity WHERE state='active';"
+psql -c "SELECT usename, count(*) FROM pg_stat_activity GROUP BY 1 ORDER BY 2 DESC;"
+
+# Overall DB activity
+psql -c "SELECT datname, xact_commit+xact_rollback AS tps_approx FROM pg_stat_database ORDER BY 2 DESC;"
+
+# Temp file usage (sorts, hashes)
+psql -c "SELECT datname, temp_files, pg_size_pretty(temp_bytes) FROM pg_stat_database ORDER BY temp_bytes DESC;"
+```
+
+---
+
+## 2) Define the Memory Budget
+Divide RAM into:
+- **25–30%** → `shared_buffers`
+- **70–75%** → `effective_cache_size` (advisory for planner, not real allocation)
+- **Remaining** → `work_mem` and OS
+- **maintenance_work_mem**: for index builds/vacuum
+
+**Golden rule for work_mem:**  
+`work_mem × (concurrent sort/hash operations)` must not exceed available memory.  
+Work_mem applies **per operation** inside a query, not per connection.
+
+### Estimating concurrency
+- Use “maximum expected heavy queries in parallel.”  
+- If ~20–30 heavy queries run in parallel, multiply that by work_mem when budgeting.
+
+**Example (8GB RAM):**
+- `shared_buffers=2GB`
+- `effective_cache_size=6GB`
+- Remaining ~ → work_mem budget  
+- Start `work_mem=16MB`, monitor, then increase if needed.
+
+---
+
+## 3) Initial Settings (Start Values)
+- `shared_buffers`: 25% of RAM (up to ~8GB before advanced configs)
+- `effective_cache_size`: 70–75% of RAM
+- `work_mem`: 8–32MB (start at 16MB for ≥8GB RAM)
+- `maintenance_work_mem`: 256–1024MB
+
+### Estimating maintenance_work_mem
+Check largest index size:
+```sql
+SELECT relname AS index, pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes ui
+JOIN pg_index i ON ui.indexrelid=i.indexrelid
+ORDER BY pg_relation_size(indexrelid) DESC
+LIMIT 5;
+```
+
+Pick a value close to your largest index size, but not excessively high.  
+Typical: 512MB–2GB.
+
+---
+
+## 4) Apply Settings in Docker
+### (A) Inline with `command:`
+```yaml
+postgres:
+  image: postgres:15
+  command:
+    - "postgres"
+    - "-c"
+    - "shared_buffers=2GB"
+    - "-c"
+    - "effective_cache_size=6GB"
+    - "-c"
+    - "work_mem=16MB"
+    - "-c"
+    - "maintenance_work_mem=512MB"
+    - "-c"
+    - "max_connections=200"
+```
+
+### (B) With custom config file
+```yaml
+postgres:
+  image: postgres:15
+  volumes:
+    - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+  command: ["postgres","-c","config_file=/etc/postgresql/postgresql.conf"]
+```
+
+> With PgBouncer, keep `max_connections` lower (pool_size ~20–50).
+
+---
+
+## 5) Monitor → Adjust
+### A) Temp file usage
+High `temp_files/temp_bytes` → increase `work_mem` gradually.
+
+```sql
+SELECT datname, temp_files, pg_size_pretty(temp_bytes)
+FROM pg_stat_database
+ORDER BY temp_bytes DESC;
+```
+
+### B) Cache hit ratio (target ≥99%)
+```sql
+SELECT
+  sum(blks_hit) / nullif(sum(blks_hit + blks_read),0)::numeric AS cache_hit_ratio
+FROM pg_stat_database;
+```
+
+Low? → increase `shared_buffers` or RAM, add indexes.
+
+### C) Heavy I/O tables
+```sql
+SELECT relname, heap_blks_read, heap_blks_hit,
+       idx_blks_read, idx_blks_hit
+FROM pg_statio_user_tables
+ORDER BY heap_blks_read DESC
+LIMIT 10;
+```
+
+### D) Query plans
+Use `EXPLAIN ANALYZE`.  
+If you see “external merge” or “disk” sorts → `work_mem` too small.
+
+---
+
+## 6) Extra Tips
+- **PgBouncer**: use `transaction` pooling mode to lower real concurrency.
+- **Autovacuum**: keep it enabled, tune if heavy write workload.
+- **Indexes**: ensure indexes support common WHERE/ORDER BY/JOIN patterns.
+- **WAL/Checkpoints**:
+  ```conf
+  max_wal_size = 2GB
+  checkpoint_completion_target = 0.9
+  ```
+- **Disk/IOPS**: if slow → SSD with higher IOPS.
+
+---
+
+## 7) Decision Checklist
+1. RAM = ________
+2. shared_buffers ≈25% → ________
+3. effective_cache_size ≈70–75% → ________
+4. Actual concurrency = ________
+5. work_mem initial = 16MB (adjust by monitoring)
+6. maintenance_work_mem = 256MB–2GB
+7. Monitor:
+   - temp_bytes/temp_files = ________
+   - cache_hit_ratio = ________ (≥99%)
+   - EXPLAIN ANALYZE shows no disk sorts? Yes/No
+
+---
+
+## 8) Baseline Configurations by RAM Size
+
+### Quick Rules of Thumb
 - `shared_buffers`: **20–25%** of RAM (cap at ~8–16GB unless DB is huge and IO is fast).
-- `effective_cache_size`: **~50–75%** of RAM (what the planner can assume is cached in OS + shared_buffers).
-- `work_mem`: **per sort/hash operation, per connection**; start small, scale cautiously. Calculate:  
-  `work_mem ≈ (RAM_left_for_work) / (concurrent_active_connections × 2)`
-- `maintenance_work_mem`: **0.5–2GB** depending on RAM; used by VACUUM/CREATE INDEX.
-- `wal_buffers`: `-1` (auto) is fine; if heavy writes, set **64MB–256MB**.
-- `max_connections`: Keep **low** (e.g., 100–200) and use PgBouncer.
-- Checkpoints: aim for **stable, infrequent** flushes. `checkpoint_timeout 15min`, `max_wal_size` sized for traffic.
-- Autovacuum: keep **on**, but tune thresholds and cost limits for your write rate.
+- `effective_cache_size`: **~50–75%** of RAM.
+- `work_mem`: per operation, per connection; start small.
+- `maintenance_work_mem`: 0.5–2GB typical.
+- `wal_buffers`: auto is fine; set manually (64–128MB) if heavy writes.
+- `max_connections`: keep low with PgBouncer.
+- `checkpoint_timeout`: 15min, `max_wal_size` sized for workload.
+- `autovacuum`: keep enabled, tune thresholds.
 
 ---
 
-## Baseline Tables
-
-### 4 GB RAM (small node, OLTP web)
-**Use case:** starter prod, small team, moderate traffic, PgBouncer required.
-
+### Example: 4 GB RAM (small node)
 ```ini
-# postgresql.conf
-max_connections = 150        # rely on PgBouncer
-shared_buffers = 1GB         # ~25% of RAM
-effective_cache_size = 2.5GB # ~65% of RAM
-work_mem = 8MB               # keep conservative
+max_connections = 150
+shared_buffers = 1GB
+effective_cache_size = 2.5GB
+work_mem = 8MB
 maintenance_work_mem = 512MB
-wal_buffers = -1             # auto (≈16MB), can raise to 64MB if heavy writes
-effective_io_concurrency = 200  # SSD/EBS gp3/gp2
-random_page_cost = 1.1       # fast SSD
+wal_buffers = -1
+effective_io_concurrency = 200
+random_page_cost = 1.1
 seq_page_cost = 1.0
 checkpoint_timeout = 15min
 max_wal_size = 4GB
@@ -49,23 +199,16 @@ autovacuum_vacuum_cost_delay = 2ms
 autovacuum_naptime = 10s
 ```
 
-**When to adjust**
-- Frequent `out of memory` on sorts → raise `work_mem` to 16MB but **watch** RSS.
-- WAL spikes/thrashing → increase `max_wal_size` to 6–8GB.
-- Slow VACUUM on large tables → raise `maintenance_work_mem` to 1GB during maintenance windows.
-
 ---
 
-### 8 GB RAM (balanced OLTP)
-**Use case:** typical production for Laravel API with read/write mix.
-
+### Example: 8 GB RAM (balanced prod)
 ```ini
 max_connections = 200
 shared_buffers = 2GB
 effective_cache_size = 5GB
 work_mem = 16MB
 maintenance_work_mem = 1GB
-wal_buffers = 64MB           # heavier write bursts
+wal_buffers = 64MB
 effective_io_concurrency = 200
 random_page_cost = 1.1
 seq_page_cost = 1.0
@@ -77,20 +220,14 @@ autovacuum_vacuum_cost_delay = 1ms
 autovacuum_naptime = 10s
 ```
 
-**Variants**
-- **Read-heavy**: keep `work_mem=16–32MB`, raise `effective_cache_size=6GB` if OS has room.
-- **Write-heavy**: `wal_buffers=128MB`, `max_wal_size=12GB`, `checkpoint_timeout=10min`, consider `synchronous_commit=off` **only** if losing a few seconds of data is acceptable.
-
 ---
 
-### 16 GB RAM (higher traffic, still single node)
-**Use case:** busy API, complex queries, nightly ETL/maintenance.
-
+### Example: 16 GB RAM (busy API)
 ```ini
 max_connections = 250
 shared_buffers = 4GB
 effective_cache_size = 10GB
-work_mem = 32MB              # monitor memory! large sorts = many MBs * concurrency
+work_mem = 32MB
 maintenance_work_mem = 2GB
 wal_buffers = 128MB
 effective_io_concurrency = 256
@@ -104,92 +241,21 @@ autovacuum_vacuum_cost_delay = 1ms
 autovacuum_naptime = 10s
 ```
 
-**Variants**
-- **Reporting/analytics windows**: temporarily bump `work_mem` to `64–128MB` (session-level), and `maintenance_work_mem=4GB` for index builds; revert after.
-- **Latency sensitive**: keep `synchronous_commit=on` (default); tune queries/indexes before relaxing durability.
+---
+
+## 9) Work_mem Worksheet
+Formula:  
+`work_mem = (RAM_for_work) / (concurrency × ops_per_query)`
+
+Example (8GB RAM, concurrency=30, ops=2):  
+RAM_for_work=5GB → 5GB/60 ≈ 85MB (too high for baseline).  
+Start **16–32MB**, increase carefully.
 
 ---
 
-## Docker Compose Examples
-
-### Option A — Env overrides
-```yaml
-services:
-  postgres:
-    image: postgres:15
-    environment:
-      POSTGRES_DB: electromall_db
-      POSTGRES_USER: electromall_admin
-      POSTGRES_PASSWORD: supersecret
-      # Optional: extra shared_buffers etc. via PGOPTIONS (not all params allowed)
-      # PGOPTIONS: "-c work_mem=16MB -c maintenance_work_mem=1GB"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
-    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
-```
-
-### Option B — Full config file
-```yaml
-services:
-  postgres:
-    image: postgres:15
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
-    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
-```
-
-### Example `postgresql.conf` (8GB baseline)
-```ini
-include_if_exists = 'local.conf'
-
-listen_addresses = '*'
-max_connections = 200
-shared_buffers = 2GB
-effective_cache_size = 5GB
-work_mem = 16MB
-maintenance_work_mem = 1GB
-wal_buffers = 64MB
-checkpoint_timeout = 15min
-max_wal_size = 8GB
-min_wal_size = 2GB
-effective_io_concurrency = 200
-random_page_cost = 1.1
-seq_page_cost = 1.0
-
-# logging
-log_min_duration_statement = 250ms
-log_checkpoints = on
-log_autovacuum_min_duration = 0
-```
-
-> Put one-off host‑specific tweaks in `local.conf` so you can change without rebuilding the image.
-
----
-
-## Work_mem Sizing Worksheet
-
-1. Determine **true concurrent active queries** (not connections). With PgBouncer, often **10–50** under load.
-2. Estimate **operations per query** (sorts/aggregations/joins). Use **2** as a safe average.  
-3. Compute:  
-   `work_mem = (RAM_for_work) / (concurrency × ops_per_query)`  
-   Example (8GB RAM):
-   - Reserve: OS + shared_buffers + other = ~3GB  
-   - RAM_for_work ≈ 5GB  
-   - concurrency = 30, ops = 2 → `work_mem ≈ 5GB / 60 ≈ 85MB` → **This is too high for baseline.**  
-   Start **16–32MB**, increase slowly while watching RSS and `OOMKill`/swap.
-
-> Remember: **work_mem applies per operation**. One connection can consume multiple `work_mem` chunks.
-
----
-
-## Autovacuum Hints
-- Tables with steady writes: lower `autovacuum_vacuum_scale_factor` per table to `0.05` (5%) and set `autovacuum_analyze_scale_factor=0.05`.
-- Hot tables: increase `autovacuum_vacuum_cost_limit` (e.g., `10000`) and reduce `cost_delay` to `0.5ms`.
-- Use `pg_stat_user_tables` to see dead tuples; `VACUUM (VERBOSE, ANALYZE)` in low-traffic windows if needed.
-
-Per-table example:
+## 10) Autovacuum Hints
+- For hot tables, lower `autovacuum_vacuum_scale_factor` to 0.05, raise cost limit, reduce delay.
+- Per-table:
 ```sql
 ALTER TABLE orders SET (
   autovacuum_vacuum_scale_factor = 0.05,
@@ -200,19 +266,14 @@ ALTER TABLE orders SET (
 
 ---
 
-## Validation Checklist
+## 11) Monitoring & Validation
+- Check memory with `docker stats` or `ps aux | grep postgres`.
+- Cache hit ratio ≥99%.
+- WAL/checkpoints stable.
+- Autovacuum keeps dead tuples low.
+- Query plans free of disk sorts.
 
-- **Memory**: `ps aux | grep postgres` RSS stable; `docker stats` for container; no swap thrash.  
-- **Latency**: p95 below SLO; monitor `pg_stat_statements` for slow queries.  
-- **WAL/Checkpoints**: steady graph; no frequent checkpoints; `max_wal_size` not exhausted.  
-- **Autovacuum**: no bloated tables; dead tuples under control.  
-- **IO**: `pg_statio_*` ratios healthy; `iostat -xm 5` without high `await`.  
-- **Connections**: PgBouncer pool hit rate good; `psql "show max_connections"` vs active backends sane.
-
----
-
-## Quick psql Commands
-
+### Helpful queries
 ```sql
 -- Top queries
 SELECT query, calls, total_exec_time, mean_exec_time
@@ -224,7 +285,7 @@ LIMIT 10;
 SELECT sum(blks_hit) / nullif(sum(blks_hit) + sum(blks_read),0)::float AS cache_hit_ratio
 FROM pg_stat_database;
 
--- Table bloat suspects (rough)
+-- Dead tuples
 SELECT schemaname, relname, n_dead_tup
 FROM pg_stat_user_tables
 ORDER BY n_dead_tup DESC
@@ -233,8 +294,10 @@ LIMIT 20;
 
 ---
 
-## Next Steps
-1. Pick the baseline matching your RAM.
-2. Apply via compose with a mounted `postgresql.conf` (Option B).
-3. Run under typical load (wrk/Gatling + real traffic).
-4. Inspect dashboards (Grafana, pgExporter) and **iterate**.
+## 12) Summary
+1. Gather baseline metrics.
+2. Define memory budget.
+3. Apply starting values (shared_buffers, effective_cache_size, work_mem, maintenance_work_mem).
+4. Pick baseline configs as templates for your RAM size.
+5. Monitor with pg_stat views and dashboards.
+6. Iterate and adjust safely.
